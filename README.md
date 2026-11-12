@@ -1,6 +1,6 @@
 # ETS2 1.61 Cabin Sound
 
-Reverses the switch to multiband EQ for cabin buses in 1.62. All vehicle cabins, will use the previous three-band EQ.
+Reverses the switch to multiband EQ for cabin window buses in 1.62. All vehicle cabins, will use the previous three-band EQ.
 Does not affect cabin sounds like blinkers, wipers, etc.
 
 **Note:** Vehicle cabins without a defined three-band EQ will fallback to the multiband EQ.

@@ -14,6 +14,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string_view>
 #include <vector>
 
@@ -85,14 +86,25 @@ std::atomic<bool> g_has_three_band[3] = {false, false, false};
 
 std::atomic<bool>& has_three_band(int bus) { return g_has_three_band[bus - kBusWindowLeft]; }
 
+// A three-band EQ with every gain at or below this is a mute placeholder. The coaches
+// define -60 dB on all bands and are tuned through the multiband EQ only.
+constexpr float kMutedGainDb = -40.0f;
+
+bool usable_three_band(const void* eq) {
+    if (!eq) return false;
+    float gain[3];
+    std::memcpy(gain, eq, sizeof(gain));
+    return gain[0] > kMutedGainDb || gain[1] > kMutedGainDb || gain[2] > kMutedGainDb;
+}
+
 void setup_detour(void* self, const void* eq_cabin_inside, const void* eq_cabin_outside, const void* multiband_nodes,
                   const void* multiband_inside, const void* multiband_outside, const void* reverb_closed,
                   const void* reverb_opened, const void* window_eq_closed, const void* window_eq_opened,
                   const void* window_multiband_nodes, const void* window_multiband_closed,
                   const void* window_multiband_opened) {
-    has_three_band(kBusWindowOut).store(eq_cabin_inside != nullptr);
-    has_three_band(kBusWindowLeft).store(window_eq_closed != nullptr);
-    has_three_band(kBusWindowRight).store(window_eq_closed != nullptr);
+    has_three_band(kBusWindowOut).store(usable_three_band(eq_cabin_inside));
+    has_three_band(kBusWindowLeft).store(usable_three_band(window_eq_closed));
+    has_three_band(kBusWindowRight).store(usable_three_band(window_eq_closed));
     g_setup_original(self, eq_cabin_inside, eq_cabin_outside, multiband_nodes, multiband_inside, multiband_outside,
                      reverb_closed, reverb_opened, window_eq_closed, window_eq_opened, window_multiband_nodes,
                      window_multiband_closed, window_multiband_opened);
