@@ -1,6 +1,8 @@
 // Hooks the following functions to use the three-band EQ instead of multiband for the cabin buses (IDs 2, 3, 4)
 //     set_three_eq_enabled(sound_system, bus_id, enabled)
 //     set_multiband_enabled(sound_system, bus_id, enabled)
+//
+// Falls back to multiband EQ if the given bus doesn't have its own three-band EQ
 
 #include "mem.hpp"
 
@@ -47,12 +49,21 @@ constexpr int kBusWindowRight = 3;
 constexpr int kBusWindowOut = 4;
 
 using set_dsp_enabled_fn = void (*)(void* sound_system, int bus_id, bool enabled);
+using cabin_effects_setup_fn = void (*)(void* self,
+                                        const void* eq_cabin_inside, const void* eq_cabin_outside,
+                                        const void* multiband_nodes, const void* multiband_inside,
+                                        const void* multiband_outside, const void* reverb_closed,
+                                        const void* reverb_opened, const void* window_eq_closed,
+                                        const void* window_eq_opened, const void* window_multiband_nodes,
+                                        const void* window_multiband_closed, const void* window_multiband_opened);
 
 scs_log_t g_log = nullptr;
 void* g_three_eq_target = nullptr;
 void* g_multiband_target = nullptr;
+void* g_setup_target = nullptr;
 set_dsp_enabled_fn g_three_eq_original = nullptr;
 set_dsp_enabled_fn g_multiband_original = nullptr;
+cabin_effects_setup_fn g_setup_original = nullptr;
 bool g_hooks_created = false;
 
 void log(std::int32_t type, const char* fmt, ...) {
@@ -69,27 +80,44 @@ void log(std::int32_t type, const char* fmt, ...) {
 
 bool is_cabin_bus(int bus) { return bus == kBusWindowLeft || bus == kBusWindowRight || bus == kBusWindowOut; }
 
-// Last state the game requested via set_multiband_enabled, per cabin bus
-constexpr int kNoRequest = -1;
-std::atomic<int> g_cabin_eq[3] = {kNoRequest, kNoRequest, kNoRequest};
+// Fallback to multiband EQ if the given bus doesn't have its own three-band EQ
+std::atomic<bool> g_has_three_band[3] = {false, false, false};
 
-std::atomic<int>& cabin_eq(int bus) { return g_cabin_eq[bus - kBusWindowLeft]; }
+std::atomic<bool>& has_three_band(int bus) { return g_has_three_band[bus - kBusWindowLeft]; }
+
+void setup_detour(void* self, const void* eq_cabin_inside, const void* eq_cabin_outside, const void* multiband_nodes,
+                  const void* multiband_inside, const void* multiband_outside, const void* reverb_closed,
+                  const void* reverb_opened, const void* window_eq_closed, const void* window_eq_opened,
+                  const void* window_multiband_nodes, const void* window_multiband_closed,
+                  const void* window_multiband_opened) {
+    has_three_band(kBusWindowOut).store(eq_cabin_inside != nullptr);
+    has_three_band(kBusWindowLeft).store(window_eq_closed != nullptr);
+    has_three_band(kBusWindowRight).store(window_eq_closed != nullptr);
+    g_setup_original(self, eq_cabin_inside, eq_cabin_outside, multiband_nodes, multiband_inside, multiband_outside,
+                     reverb_closed, reverb_opened, window_eq_closed, window_eq_opened, window_multiband_nodes,
+                     window_multiband_closed, window_multiband_opened);
+}
+
+bool force_three_band(int bus) { return is_cabin_bus(bus) && has_three_band(bus).load(); }
 
 void three_eq_detour(void* sound_system, int bus, bool enabled) {
-    if (is_cabin_bus(bus)) {
-        const int wanted = cabin_eq(bus).load();
-        if (wanted != kNoRequest) enabled = wanted != 0;
-    }
-    g_three_eq_original(sound_system, bus, enabled);
+    g_three_eq_original(sound_system, bus, force_three_band(bus) ? true : enabled);
 }
 
 void multiband_detour(void* sound_system, int bus, bool enabled) {
-    if (is_cabin_bus(bus)) {
-        cabin_eq(bus).store(enabled ? 1 : 0);
-        g_three_eq_original(sound_system, bus, enabled);
-        enabled = false;
+    g_multiband_original(sound_system, bus, force_three_band(bus) ? false : enabled);
+}
+
+// Find the setup function that calls three_eq
+void* find_setup(const std::uint8_t* text, std::size_t size, const void* three_eq) {
+    const void* start = nullptr;
+    const auto calls = find_calls_to(text, size, three_eq);
+    for (const std::uint8_t* call : calls) {
+        const void* f = function_start(call);
+        if (!f || (start && f != start)) return nullptr;
+        start = f;
     }
-    g_multiband_original(sound_system, bus, enabled);
+    return const_cast<void*>(start);
 }
 
 void* find_wrapper(const std::uint8_t* text, std::size_t size, std::uint8_t slot) {
@@ -100,7 +128,7 @@ void* find_wrapper(const std::uint8_t* text, std::size_t size, std::uint8_t slot
 
 void uninstall() {
     if (g_hooks_created) MH_DisableHook(MH_ALL_HOOKS);
-    for (auto& state : g_cabin_eq) state.store(kNoRequest);
+    for (auto& flag : g_has_three_band) flag.store(false);
 }
 
 bool create_hooks() {
@@ -113,8 +141,12 @@ bool create_hooks() {
     g_three_eq_target = find_wrapper(text, size, kSlotThreeEq);
     g_multiband_target = find_wrapper(text, size, kSlotMultiband);
     if (!g_three_eq_target || !g_multiband_target) {
-        log(SCS_LOG_TYPE_error, "sound functions not found (three-EQ %p, multiband %p): unsupported game version, "
-            "plugin inactive", g_three_eq_target, g_multiband_target);
+        log(SCS_LOG_TYPE_error, "sound functions not found (three-EQ %p, multiband %p)", g_three_eq_target, g_multiband_target);
+        return false;
+    }
+    g_setup_target = find_setup(text, size, g_three_eq_target);
+    if (!g_setup_target) {
+        log(SCS_LOG_TYPE_error, "setup function not found");
         return false;
     }
     const MH_STATUS init = MH_Initialize();
@@ -125,10 +157,13 @@ bool create_hooks() {
     if (MH_CreateHook(g_three_eq_target, reinterpret_cast<void*>(&three_eq_detour),
                       reinterpret_cast<void**>(&g_three_eq_original)) != MH_OK ||
         MH_CreateHook(g_multiband_target, reinterpret_cast<void*>(&multiband_detour),
-                      reinterpret_cast<void**>(&g_multiband_original)) != MH_OK) {
+                      reinterpret_cast<void**>(&g_multiband_original)) != MH_OK ||
+        MH_CreateHook(g_setup_target, reinterpret_cast<void*>(&setup_detour),
+                      reinterpret_cast<void**>(&g_setup_original)) != MH_OK) {
         log(SCS_LOG_TYPE_error, "hooking failed");
         MH_Uninitialize();
         g_three_eq_original = g_multiband_original = nullptr;
+        g_setup_original = nullptr;
         return false;
     }
     g_hooks_created = true;
@@ -149,9 +184,11 @@ bool install() {
         return false;
     }
     const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-    log(SCS_LOG_TYPE_message, "active: 3-band cabin EQ as in 1.61 (hooks at exe+%#llx, exe+%#llx)",
-        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(g_three_eq_target) - base),
-        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(g_multiband_target) - base));
+    auto rva = [base](const void* p) {
+        return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(p) - base);
+    };
+    log(SCS_LOG_TYPE_message, "active (hooks at exe+%#llx, exe+%#llx, setup exe+%#llx)",
+        rva(g_three_eq_target), rva(g_multiband_target), rva(g_setup_target));
     return true;
 }
 

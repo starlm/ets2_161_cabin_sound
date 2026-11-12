@@ -1,5 +1,7 @@
 #include "mem.hpp"
 
+#include <cstring>
+
 std::vector<int> parse_pattern(std::string_view text) {
     std::vector<int> out;
     for (std::size_t i = 0; i < text.size();) {
@@ -29,8 +31,8 @@ void* find_unique(const std::uint8_t* begin, std::size_t size, const std::vector
     return found;
 }
 
-bool text_section(const std::uint8_t** begin, std::size_t* size) {
-    auto* base = reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr));
+bool text_section(const std::uint8_t** begin, std::size_t* size, HMODULE module) {
+    auto* base = reinterpret_cast<const std::uint8_t*>(module ? module : GetModuleHandleW(nullptr));
     auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     auto* sec = IMAGE_FIRST_SECTION(nt);
@@ -42,4 +44,29 @@ bool text_section(const std::uint8_t** begin, std::size_t* size) {
         }
     }
     return false;
+}
+
+std::vector<const std::uint8_t*> find_calls_to(const std::uint8_t* begin, std::size_t size, const void* target) {
+    std::vector<const std::uint8_t*> out;
+    for (std::size_t i = 0; i + 5 <= size; ++i) {
+        if (begin[i] != 0xE8) continue;
+        std::int32_t rel;
+        std::memcpy(&rel, begin + i + 1, 4);
+        if (begin + i + 5 + rel == target) out.push_back(begin + i);
+    }
+    return out;
+}
+
+const void* function_start(const void* addr) {
+    constexpr std::uint8_t kChainInfo = 0x4;  // UNW_FLAG_CHAININFO
+    DWORD64 base = 0;
+    const RUNTIME_FUNCTION* rf = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(addr), &base, nullptr);
+    // A function split into chunks has chained entries; the primary one holds the real start
+    for (int depth = 0; rf && depth < 32; ++depth) {
+        auto* info = reinterpret_cast<const std::uint8_t*>(base + rf->UnwindData);
+        if (!((info[0] >> 3) & kChainInfo)) return reinterpret_cast<const void*>(base + rf->BeginAddress);
+        const std::uint8_t codes = info[2];  // UNWIND_CODE slots, padded to an even count, precede the chained entry
+        rf = reinterpret_cast<const RUNTIME_FUNCTION*>(info + 4 + ((codes + 1) & ~1) * 2);
+    }
+    return nullptr;
 }
